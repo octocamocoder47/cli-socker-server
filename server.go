@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 
 	prompt "github.com/c-bata/go-prompt"
 )
 
 var CLIENTS = map[uint]*Connection{}
-var server *Server // Global server reference
+var server *Server                  // Global server reference
 var commands = map[string]Command{} // Empty map to be filled later
 var Free_IDs = []uint{}
 var IDSList = [100]bool{}
@@ -48,8 +49,7 @@ func GetID() uint {
 //     return
 // }
 
-
-// ---------------- Server & Connection ----------------
+// ---------------- Server ----------------
 
 type Server struct {
 	Listener net.Listener
@@ -66,9 +66,15 @@ func NewServer(host string, port int, network string) *Server {
 	}
 }
 
-func (s *Server) BroadCast(data []byte) {
-	for _, client := range CLIENTS {
-		client.SendData(data)
+func (s *Server) BroadCast(senderID uint, data []byte) {
+	for id, client := range CLIENTS {
+		// Don't send message back to sender
+		if id == senderID {
+			continue
+		}
+		if err := client.SendData(data); err != nil {
+			s.serverLog("Failed to send to client %d: %v", id, err)
+		}
 	}
 }
 
@@ -91,7 +97,7 @@ func (s *Server) CreateServer() {
 		}
 		id := GetID()
 		cn := &Connection{
-			ID: id,
+			ID:   id,
 			Conn: conn,
 		}
 		CLIENTS[id] = cn
@@ -101,23 +107,56 @@ func (s *Server) CreateServer() {
 }
 
 func (s *Server) HandleConnection(conn *Connection) {
-	defer conn.Close()
-	buffer, err := conn.ReceiveData()
-	if err != nil {
-		s.serverLog("Error receiving: %v", err)
-		return
-	}
-	s.serverLog("Received: %s", string(buffer))
-	err = conn.SendData(buffer)
-	if err != nil {
-		s.serverLog("Error sending: %v", err)
-	}
+	outputChan := make(chan []byte, 1024)
+	done := make(chan struct{})
+	defer close(done)
+
+	// Start a goroutine to continuously receive data
+	go func() {
+		defer conn.Close()
+
+		for {
+			select {
+			case <-done:
+				return
+			default:
+				if err := conn.ReceiveData(outputChan); err != nil {
+					s.serverLog("Client %d disconnected: %v", conn.ID, err)
+					return
+				}
+
+				select {
+				case buffer := <-outputChan:
+					if string(buffer) == "exit" {
+						return
+					}
+					// Broadcast the received data directly
+					go s.BroadCast(conn.ID, buffer)
+				case <-done:
+					return
+				}
+			}
+		}
+	}()
+
+	// Keep the connection alive
+	<-done
 }
 
 func (s *Server) serverLog(msg string, args ...any) {
 	fmt.Printf("\n[SERVER] "+msg+"\n", args...)
 	fmt.Print("CLI > ")
 }
+
+func (s *Server) Remove(id uint) {
+	if _, ok := CLIENTS[id]; ok {
+		delete(CLIENTS, id)
+	}
+	s.serverLog("Client %d removed", id)
+	return
+}
+
+// ---------------- Connection ----------------
 
 type Connection struct {
 	ID   uint
@@ -127,51 +166,32 @@ type Connection struct {
 func (c *Connection) Close() {
 	if c.Conn != nil {
 		c.Conn.Close()
-		delete(CLIENTS, c.ID)
-		RemoveID(c.ID)
-		s := fmt.Sprintf("Client %d disconnected", c.ID)
-		server.serverLog(s)
-		return
+		if _, exists := CLIENTS[c.ID]; exists {
+			delete(CLIENTS, c.ID)
+			RemoveID(c.ID)
+			s := fmt.Sprintf("Client %d disconnected", c.ID)
+			server.serverLog(s)
+		}
 	}
-	
-	if c.ID != 0 {
-		delete(CLIENTS, c.ID)
-	}
-	RemoveID(c.ID)
-	s := fmt.Sprintf("Client %d disconnected", c.ID)
-	server.serverLog(s)
-	return
 }
 
-func (c *Connection) ReceiveData() ([]byte, error) {
-	var data []byte
+func (c *Connection) ReceiveData(ch chan []byte) error {
 	buffer := make([]byte, 1024)
-	for {
-		n, err := c.Conn.Read(buffer)
-		if n > 0 {
-			data = append(data, buffer[:n]...)
-		}
-		if err != nil {
-			if len(data) > 0 {
-				return data, nil
-			}
-			return nil, err
-		}
-		if n < len(buffer) {
-			break
-		}
+	n, err := c.Conn.Read(buffer)
+	if err != nil {
+		return err
 	}
-	return data, nil
+	if n > 0 {
+		ch <- buffer[:n]
+	}
+	return nil
 }
 
 func (c *Connection) SendData(data []byte) error {
-	totalSent := 0
-	for totalSent < len(data) {
-		n, err := c.Conn.Write(data[totalSent:])
-		if err != nil {
-			return err
-		}
-		totalSent += n
+
+	_, err := c.Conn.Write(data)
+	if err != nil {
+		return fmt.Errorf("failed to write: %w", err)
 	}
 	return nil
 }
@@ -179,6 +199,8 @@ func (c *Connection) SendData(data []byte) error {
 func (c *Connection) String() string {
 	return c.Conn.RemoteAddr().String()
 }
+
+// --------------- Command Line Interface ---------------
 
 type Command struct {
 	Run         func(args []string)
@@ -229,7 +251,8 @@ func AddCommands() {
 				return
 			}
 			msg := strings.Join(args, " ")
-			server.BroadCast([]byte(msg))
+			// Send the message directly as []byte
+			server.BroadCast(0, []byte(msg))
 		},
 		Description: "Broadcast a message to all clients",
 	}
@@ -240,6 +263,23 @@ func AddCommands() {
 			os.Exit(0)
 		},
 		Description: "Exit the server",
+	}
+
+	commands["remove"] = Command{
+		Run: func(args []string) {
+			fmt.Println("Usage: remove <client_id>")
+			if len(args) < 1 {
+				fmt.Println("Usage: remove <client_id>")
+				return
+			}
+			id, err := strconv.Atoi(args[0])
+			if err != nil {
+				fmt.Println("Invalid client ID:", args[0])
+				return
+			}
+			server.Remove(uint(id))
+		},
+		Description: "Remove a client using ID",
 	}
 
 	commands["help"] = Command{
